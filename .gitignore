@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Env files — never commit real secrets, only .env.example
+.env
+.env.local
+.env.*.local
+
+# Build output
+backend/dist/
+frontend/dist/
+*.tsbuildinfo
+
+# Editor/OS
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
