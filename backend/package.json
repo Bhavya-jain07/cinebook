@@ -4,7 +4,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc -b",
-    "start": "node dist/scripts/seed.js && node dist/src/index.js",
+    "start": "node dist/src/index.js",
     "dev": "tsx watch src/index.ts",
     "seed": "tsx scripts/seed.ts"
   },
