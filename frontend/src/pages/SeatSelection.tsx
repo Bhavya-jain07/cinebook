@@ -365,13 +365,13 @@ export function SeatSelection() {
           disabled={selected.size === 0}
           className="w-full rounded-full bg-[#2a0c19] py-3 font-bold text-paper transition enabled:hover:bg-black disabled:opacity-40"
         >
-          Hold seats for 10 minutes
+          Proceed to pay{selected.size > 0 ? ` ₹${totalAmount}` : ""}
         </button>
       )}
       {phase === "held" && (
         <div className="space-y-2">
           <button onClick={confirmBooking} className="w-full rounded-full bg-[#2a0c19] py-3 font-bold text-paper transition hover:bg-black">
-            Confirm and pay ₹{totalAmount}
+            Pay ₹{totalAmount}
           </button>
           <button onClick={changeSeats} className="w-full py-1.5 text-sm font-semibold underline-offset-4 hover:underline">
             Change seats
@@ -504,7 +504,7 @@ export function SeatSelection() {
               {phase === "held" && (
                 <div className="mt-4" role="timer" aria-label="Time left to pay">
                   <div className="flex items-baseline justify-between">
-                    <span className="text-sm font-semibold">{urgent ? "Hurry, seats release soon" : "Seats held for you"}</span>
+                    <span className="text-sm font-semibold">{urgent ? "Hurry, seats release soon" : "Seats reserved while you pay"}</span>
                     <span className={`display text-4xl ${urgent ? "text-[#b3261e]" : ""}`}>{clock}</span>
                   </div>
                   <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[#2a0c19]/15">
@@ -547,6 +547,9 @@ export function SeatSelection() {
                 </>
               )}
               <div className="mt-5">{actions}</div>
+              {phase === "selecting" && selected.size > 0 && (
+                <p className="mt-3 text-center text-xs opacity-70">Your seats are reserved for {Math.round(holdTotal / 60)} minutes once you proceed.</p>
+              )}
             </div>
           </div>
         </aside>
@@ -558,7 +561,7 @@ export function SeatSelection() {
           {phase === "held" && (
             <div className="mb-3" role="timer" aria-label="Time left to pay">
               <div className="flex items-baseline justify-between text-sm">
-                <span className={urgent ? "font-semibold text-coral" : "text-dust"}>{urgent ? "Hurry, seats release soon" : "Seats held for you"}</span>
+                <span className={urgent ? "font-semibold text-coral" : "text-dust"}>{urgent ? "Hurry, seats release soon" : "Seats reserved while you pay"}</span>
                 <span className={`display text-3xl ${urgent ? "text-coral" : "text-marquee"}`}>{clock}</span>
               </div>
               <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-paper/15">
@@ -585,7 +588,7 @@ export function SeatSelection() {
                 disabled={selected.size === 0}
                 className="shrink-0 rounded-full bg-marquee px-5 py-2.5 font-bold text-pit transition enabled:hover:brightness-110 disabled:opacity-40"
               >
-                Hold seats
+                Proceed to pay
               </button>
             )}
             {phase === "held" && (
