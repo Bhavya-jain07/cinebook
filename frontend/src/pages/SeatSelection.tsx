@@ -1,12 +1,24 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, socket, friendlyError } from "../lib/api";
 import { Movie, Seat, SeatEvent, Showtime, Theater } from "../lib/types";
+import { formatDateLong, formatTime } from "../lib/format";
 import { Navbar } from "../components/Navbar";
 import { useToast } from "../components/Toast";
 
 type SessionState = { status: "checking" } | { status: "queued"; position: number; queueLength: number } | { status: "active" };
 type Phase = "selecting" | "held" | "confirming" | "confirmed";
+
+function seatClass(seat: Seat, isSelected: boolean) {
+  if (isSelected) return "seat-selected";
+  if (seat.status === "booked") return "seat-booked";
+  if (seat.status === "held") return "seat-held";
+  return seat.isPremium ? "seat-premium" : "seat-available";
+}
+
+function Swatch({ cls }: { cls: string }) {
+  return <span className={`seat inline-block h-5 w-5 ${cls}`} aria-hidden="true" />;
+}
 
 export function SeatSelection() {
   const { id } = useParams();
@@ -20,8 +32,19 @@ export function SeatSelection() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [phase, setPhase] = useState<Phase>("selecting");
   const [holdExpiresAt, setHoldExpiresAt] = useState<number | null>(null);
+  const [holdTotal, setHoldTotal] = useState(600);
   const [now, setNow] = useState(Date.now());
+  const [bookingRef, setBookingRef] = useState<string | null>(null);
+  const [live, setLive] = useState(false);
+  const [flash, setFlash] = useState<Set<string>>(new Set());
+  const [lastEvent, setLastEvent] = useState<string>("");
   const idempotencyKeyRef = useRef<string>(crypto.randomUUID());
+
+  // Refs mirror state so the unmount cleanup sees current values, not the first render's.
+  const phaseRef = useRef<Phase>(phase);
+  const selectedRef = useRef<Set<string>>(selected);
+  phaseRef.current = phase;
+  selectedRef.current = selected;
 
   const loadSeatMap = useCallback(async () => {
     const res = await api.get(`/showtimes/${showtimeId}`);
@@ -61,6 +84,23 @@ export function SeatSelection() {
     socket.connect();
     socket.emit("join_showtime", showtimeId);
 
+    const onConnect = () => setLive(true);
+    const onDisconnect = () => setLive(false);
+    socket.on("connect", onConnect);
+    socket.on("disconnect", onDisconnect);
+    setLive(socket.connected);
+
+    function pulse(ids: string[]) {
+      setFlash((prev) => new Set([...prev, ...ids]));
+      setTimeout(() => {
+        setFlash((prev) => {
+          const next = new Set(prev);
+          ids.forEach((i) => next.delete(i));
+          return next;
+        });
+      }, 900);
+    }
+
     function onSeatEvent(event: SeatEvent) {
       setSeats((prev) =>
         prev.map((s) => {
@@ -76,21 +116,36 @@ export function SeatSelection() {
           return s;
         })
       );
+
+      // Visual cue + plain-text announcement for changes made by other people.
+      if (event.type === "seat_booked") {
+        const others = event.seats.filter((s) => !selectedRef.current.has(s));
+        if (others.length) {
+          pulse(others);
+          setLastEvent(`${others.join(", ")} just booked by someone else`);
+        }
+      } else if (!selectedRef.current.has(event.seat)) {
+        pulse([event.seat]);
+        setLastEvent(event.type === "seat_held" ? `${event.seat} was just held by someone else` : `${event.seat} is available again`);
+      }
     }
     socket.on("seat_event", onSeatEvent);
 
     return () => {
+      socket.off("connect", onConnect);
+      socket.off("disconnect", onDisconnect);
       socket.off("seat_event", onSeatEvent);
       socket.emit("leave_showtime", showtimeId);
       socket.disconnect();
+      setLive(false);
     };
   }, [session.status, showtimeId, loadSeatMap]);
 
   // ---------- Release held seats / end session on unmount, if not confirmed ----------
   useEffect(() => {
     return () => {
-      if (phase === "held" && selected.size > 0) {
-        api.post(`/showtimes/${showtimeId}/release`, { seats: Array.from(selected) }).catch(() => {});
+      if (phaseRef.current === "held" && selectedRef.current.size > 0) {
+        api.post(`/showtimes/${showtimeId}/release`, { seats: Array.from(selectedRef.current) }).catch(() => {});
       }
       api.delete(`/showtimes/${showtimeId}/session`).catch(() => {});
     };
@@ -104,6 +159,18 @@ export function SeatSelection() {
     return () => clearInterval(t);
   }, [holdExpiresAt]);
 
+  // When the hold runs out, send the user back to selecting instead of leaving a dead "Confirm" button.
+  useEffect(() => {
+    if (phase !== "held" || !holdExpiresAt || now < holdExpiresAt) return;
+    setPhase("selecting");
+    setSelected(new Set());
+    setHoldExpiresAt(null);
+    idempotencyKeyRef.current = crypto.randomUUID();
+    loadSeatMap();
+    showToast("Your hold expired. Pick your seats again.", "error");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [now, phase, holdExpiresAt]);
+
   function toggleSeat(seat: Seat) {
     if (seat.status !== "available" && !selected.has(seat.id)) return;
     if (seat.status === "booked" || seat.status === "held") return;
@@ -112,7 +179,7 @@ export function SeatSelection() {
       if (next.has(seat.id)) next.delete(seat.id);
       else {
         if (next.size >= 10) {
-          showToast("Max 10 seats per booking", "error");
+          showToast("You can book up to 10 seats at a time.", "error");
           return prev;
         }
         next.add(seat.id);
@@ -125,6 +192,8 @@ export function SeatSelection() {
     if (selected.size === 0) return;
     try {
       const res = await api.post(`/showtimes/${showtimeId}/hold`, { seats: Array.from(selected) });
+      setHoldTotal(res.data.expiresInSeconds);
+      setNow(Date.now());
       setHoldExpiresAt(Date.now() + res.data.expiresInSeconds * 1000);
       setPhase("held");
     } catch (err: any) {
@@ -133,190 +202,411 @@ export function SeatSelection() {
     }
   }
 
+  async function changeSeats() {
+    const ids = Array.from(selected);
+    api.post(`/showtimes/${showtimeId}/release`, { seats: ids }).catch(() => {});
+    setSeats((prev) => prev.map((s) => (selected.has(s.id) && s.status === "held" ? { ...s, status: "available" } : s)));
+    setHoldExpiresAt(null);
+    setPhase("selecting");
+  }
+
   async function confirmBooking() {
     setPhase("confirming");
     try {
-      await api.post("/bookings/confirm", {
+      const res = await api.post("/bookings/confirm", {
         showtimeId,
         seats: Array.from(selected),
         idempotencyKey: idempotencyKeyRef.current,
       });
+      setBookingRef(res.data?.booking?._id ?? null);
       setPhase("confirmed");
-      showToast("Booking confirmed!");
+      showToast("Booking confirmed.");
     } catch (err: any) {
       showToast(friendlyError(err), "error");
       setPhase("held");
     }
   }
 
-  // ---------- Waiting room UI ----------
+  const movie = showtime?.movieId as Movie | undefined;
+  const theater = showtime?.theaterId as Theater | undefined;
+
+  const rowLetters = useMemo(() => (showtime ? Array.from({ length: showtime.rows }, (_, i) => String.fromCharCode(65 + i)) : []), [showtime]);
+  const seatsByRow = useMemo(() => {
+    const map = new Map<string, Seat[]>();
+    for (const letter of rowLetters) {
+      map.set(
+        letter,
+        seats
+          .filter((s) => s.id.startsWith(letter) && /^\d+$/.test(s.id.slice(letter.length)))
+          .sort((a, b) => Number(a.id.slice(letter.length)) - Number(b.id.slice(letter.length)))
+      );
+    }
+    return map;
+  }, [seats, rowLetters]);
+
+  const chosen = seats.filter((s) => selected.has(s.id));
+  const totalAmount = chosen.reduce((sum, s) => sum + s.price, 0);
+  const premiumCount = chosen.filter((s) => s.isPremium).length;
+  const regularCount = chosen.length - premiumCount;
+  const premiumTotal = chosen.filter((s) => s.isPremium).reduce((a, s) => a + s.price, 0);
+  const regularTotal = totalAmount - premiumTotal;
+
+  const secondsLeft = holdExpiresAt ? Math.max(0, Math.floor((holdExpiresAt - now) / 1000)) : 0;
+  const clock = `${Math.floor(secondsLeft / 60)}:${String(secondsLeft % 60).padStart(2, "0")}`;
+  const urgent = phase === "held" && secondsLeft <= 60;
+  const progress = holdTotal > 0 ? Math.min(100, (secondsLeft / holdTotal) * 100) : 0;
+
+  const regularPrice = showtime?.regularPrice;
+  const premiumPrice = showtime?.premiumPrice;
+
+  // ---------- Waiting room ----------
   if (session.status === "checking") {
     return (
       <div className="min-h-screen">
         <Navbar />
-        <div className="max-w-md mx-auto px-5 py-20 text-center text-cinema-muted text-sm">Checking availability…</div>
-      </div>
-    );
-  }
-
-  if (session.status === "queued") {
-    return (
-      <div className="min-h-screen">
-        <Navbar />
-        <div className="max-w-md mx-auto px-5 py-20 text-center">
-          <div className="w-16 h-16 rounded-full border-4 border-cinema-red border-t-transparent animate-spin mx-auto mb-6" />
-          <h2 className="font-display text-2xl tracking-wide mb-2">YOU'RE IN THE QUEUE</h2>
-          <p className="text-cinema-muted text-sm mb-1">
-            Position <span className="text-cinema-text font-semibold">{session.position}</span> of{" "}
-            {session.queueLength}
-          </p>
-          <p className="text-cinema-muted text-xs mt-4">
-            This showtime is in high demand — we'll let you in automatically as soon as a spot opens up.
-          </p>
+        <div className="mx-auto max-w-md px-5 py-28 text-center text-dust" role="status">
+          <div className="mx-auto mb-5 h-10 w-10 animate-spin rounded-full border-4 border-marquee border-t-transparent" />
+          Checking availability…
         </div>
       </div>
     );
   }
 
-  if (phase === "confirmed") {
+  if (session.status === "queued") {
+    const ahead = Math.max(0, session.position - 1);
+    const dots = Math.min(session.queueLength, 14);
+    const you = Math.min(session.position, dots);
     return (
       <div className="min-h-screen">
         <Navbar />
-        <div className="max-w-md mx-auto px-5 py-20 text-center">
-          <div className="w-14 h-14 rounded-full bg-cinema-red/15 border border-cinema-red flex items-center justify-center mx-auto mb-5">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-cinema-red">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M20 6 9 17l-5-5" />
-            </svg>
-          </div>
-          <h2 className="font-display text-2xl tracking-wide mb-2">BOOKING CONFIRMED</h2>
-          <p className="text-cinema-muted text-sm mb-6">
-            Seats {Array.from(selected).join(", ")} are yours. Enjoy the show!
+        <div className="mx-auto max-w-md px-5 py-20 text-center">
+          <p className="text-sm text-dust">This showtime is busy, so we're letting people in one by one.</p>
+          <p className="display mt-4 text-[120px] text-marquee" aria-live="polite">
+            {session.position}
           </p>
-          <button
-            onClick={() => navigate("/my-bookings")}
-            className="bg-cinema-red text-white text-sm font-semibold px-6 py-2.5 rounded-lg hover:bg-cinema-redDark transition"
-          >
-            View my bookings
+          <h1 className="display text-4xl">{ahead === 0 ? "You're next" : `${ahead} ${ahead === 1 ? "person" : "people"} ahead of you`}</h1>
+
+          <div className="mt-8 flex items-center justify-center gap-1.5" aria-hidden="true">
+            {Array.from({ length: dots }).map((_, i) => (
+              <span key={i} className={`h-3 w-3 rounded-full ${i + 1 === you ? "animate-pulseDot bg-marquee" : "bg-paper/20"}`} />
+            ))}
+          </div>
+
+          <p className="mt-8 text-sm leading-relaxed text-dust">
+            Keep this tab open. We check your spot every few seconds and will open the seat map automatically.
+          </p>
+          <button onClick={() => navigate(-1)} className="mt-6 text-sm font-semibold text-paper/70 underline-offset-4 hover:text-paper hover:underline">
+            Leave the queue
           </button>
         </div>
       </div>
     );
   }
 
-  const movie = showtime?.movieId as Movie | undefined;
-  const theater = showtime?.theaterId as Theater | undefined;
-  const secondsLeft = holdExpiresAt ? Math.max(0, Math.floor((holdExpiresAt - now) / 1000)) : 0;
-  const mins = Math.floor(secondsLeft / 60);
-  const secs = secondsLeft % 60;
-
-  const rows = showtime ? Array.from({ length: showtime.rows }, (_, i) => String.fromCharCode(65 + i)) : [];
-  const totalAmount = seats.filter((s) => selected.has(s.id)).reduce((sum, s) => sum + s.price, 0);
-
-  return (
-    <div className="min-h-screen">
-      <Navbar />
-
-      <main className="max-w-3xl mx-auto px-5 py-8">
-        {movie && (
-          <div className="mb-6">
-            <h1 className="font-display text-2xl tracking-wide">{movie.title}</h1>
-            <p className="text-xs text-cinema-muted mt-1">
-              {theater?.name} · {showtime && new Date(showtime.dateTime).toLocaleString()}
-            </p>
-          </div>
-        )}
-
-        {phase === "held" && (
-          <div className="flex items-center justify-between bg-cinema-red/10 border border-cinema-red/40 rounded-lg px-4 py-2.5 mb-6 text-sm">
-            <span className="text-cinema-text">Seats held — complete payment before the timer runs out</span>
-            <span className="font-mono font-semibold text-cinema-red">
-              {mins}:{String(secs).padStart(2, "0")}
-            </span>
-          </div>
-        )}
-
-        {/* Screen indicator */}
-        <div className="mb-8">
-          <div className="h-2 bg-gradient-to-r from-transparent via-cinema-muted/40 to-transparent rounded-full mb-1" />
-          <p className="text-center text-[10px] uppercase tracking-[0.3em] text-cinema-muted">Screen this way</p>
-        </div>
-
-        {/* Seat grid */}
-        <div className="flex flex-col items-center gap-2 mb-8 overflow-x-auto">
-          {rows.map((rowLetter) => (
-            <div key={rowLetter} className="flex items-center gap-2">
-              <span className="w-4 text-xs text-cinema-muted">{rowLetter}</span>
-              <div className="flex gap-1.5">
-                {seats
-                  .filter((s) => s.id.startsWith(rowLetter) && /^\d+$/.test(s.id.slice(rowLetter.length)))
-                  .sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)))
-                  .map((seat) => {
-                    const isSelected = selected.has(seat.id);
-                    const disabled = phase !== "selecting" || (seat.status !== "available" && !isSelected);
-                    return (
-                      <button
-                        key={seat.id}
-                        disabled={disabled}
-                        onClick={() => toggleSeat(seat)}
-                        title={`${seat.id} — ₹${seat.price}${seat.isPremium ? " (premium)" : ""}`}
-                        className={`w-6 h-6 sm:w-7 sm:h-7 rounded-t-md text-[9px] flex items-center justify-center font-medium transition ${
-                          isSelected
-                            ? "bg-cinema-red text-white"
-                            : seat.status === "booked"
-                            ? "bg-cinema-surfaceLight text-cinema-muted/30 cursor-not-allowed"
-                            : seat.status === "held"
-                            ? "bg-cinema-gold/30 text-cinema-gold cursor-not-allowed"
-                            : seat.isPremium
-                            ? "bg-cinema-surfaceLight border border-cinema-gold/40 hover:border-cinema-gold text-cinema-gold"
-                            : "bg-cinema-surfaceLight border border-cinema-border hover:border-cinema-red"
-                        }`}
-                      >
-                        {seat.id.slice(rowLetter.length)}
-                      </button>
-                    );
-                  })}
+  // ---------- Confirmed ----------
+  if (phase === "confirmed") {
+    return (
+      <div className="min-h-screen">
+        <Navbar />
+        <div className="mx-auto max-w-md px-5 py-14">
+          <p className="display mb-6 text-center text-6xl text-marquee">You're going.</p>
+          <div className="ticket animate-rise">
+            <div className="p-6 pb-7">
+              <h2 className="display text-4xl">{movie?.title}</h2>
+              <p className="mt-1">{theater?.name}</p>
+              {showtime && (
+                <p className="text-sm opacity-70">
+                  {formatDateLong(showtime.dateTime)} at {formatTime(showtime.dateTime)}, {showtime.screenName}
+                </p>
+              )}
+            </div>
+            <div className="perf-h px-6 py-5">
+              <p className="text-xs font-semibold opacity-70">Seats</p>
+              <div className="mt-1.5 flex flex-wrap gap-1.5">
+                {Array.from(selected).map((s) => (
+                  <span key={s} className="rounded bg-[#2a0c19] px-2 py-1 text-sm font-bold text-paper">
+                    {s}
+                  </span>
+                ))}
+              </div>
+              <div className="mt-4 flex items-end justify-between">
+                <div>
+                  <p className="text-xs font-semibold opacity-70">Paid</p>
+                  <p className="text-2xl font-extrabold">₹{totalAmount}</p>
+                </div>
+                {bookingRef && (
+                  <div className="text-right">
+                    <p className="text-xs font-semibold opacity-70">Booking reference</p>
+                    <p className="font-bold">{bookingRef.slice(-8).toUpperCase()}</p>
+                  </div>
+                )}
               </div>
             </div>
-          ))}
+          </div>
+          <div className="mt-8 flex flex-col gap-3 sm:flex-row">
+            <button onClick={() => navigate("/my-bookings")} className="flex-1 rounded-full bg-marquee py-3 font-bold text-pit transition hover:brightness-110">
+              View my bookings
+            </button>
+            <button onClick={() => navigate("/")} className="flex-1 rounded-full border border-paper/25 py-3 font-bold transition hover:bg-velvet">
+              Back to movies
+            </button>
+          </div>
         </div>
+      </div>
+    );
+  }
 
-        {/* Legend */}
-        <div className="flex flex-wrap justify-center gap-4 text-xs text-cinema-muted mb-8">
-          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-cinema-surfaceLight border border-cinema-border inline-block" /> Available</span>
-          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-cinema-red inline-block" /> Selected</span>
-          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-cinema-gold/30 inline-block" /> Held by another user</span>
-          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-cinema-surfaceLight inline-block opacity-40" /> Booked</span>
+  // ---------- Seat map ----------
+  const actions = (
+    <>
+      {phase === "selecting" && (
+        <button
+          onClick={proceedToHold}
+          disabled={selected.size === 0}
+          className="w-full rounded-full bg-[#2a0c19] py-3 font-bold text-paper transition enabled:hover:bg-black disabled:opacity-40"
+        >
+          Hold seats for 10 minutes
+        </button>
+      )}
+      {phase === "held" && (
+        <div className="space-y-2">
+          <button onClick={confirmBooking} className="w-full rounded-full bg-[#2a0c19] py-3 font-bold text-paper transition hover:bg-black">
+            Confirm and pay ₹{totalAmount}
+          </button>
+          <button onClick={changeSeats} className="w-full py-1.5 text-sm font-semibold underline-offset-4 hover:underline">
+            Change seats
+          </button>
         </div>
+      )}
+      {phase === "confirming" && (
+        <button disabled className="flex w-full items-center justify-center gap-2 rounded-full bg-[#2a0c19] py-3 font-bold text-paper opacity-80">
+          <span className="h-4 w-4 animate-spin rounded-full border-2 border-paper border-t-transparent" />
+          Confirming…
+        </button>
+      )}
+    </>
+  );
 
-        {/* Bottom action bar */}
-        {selected.size > 0 && (
-          <div className="sticky bottom-4 bg-cinema-surface border border-cinema-border rounded-xl p-4 flex items-center justify-between shadow-xl">
-            <div>
-              <p className="text-sm font-semibold">{selected.size} seat{selected.size > 1 ? "s" : ""} · ₹{totalAmount}</p>
-              <p className="text-xs text-cinema-muted">{Array.from(selected).join(", ")}</p>
+  return (
+    <div className="min-h-screen pb-40 lg:pb-0">
+      <Navbar />
+
+      <div className="folds">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-end justify-between gap-3 px-5 pb-6 pt-8">
+          <div>
+            <h1 className="display text-5xl sm:text-6xl">{movie?.title ?? "Loading…"}</h1>
+            {showtime && (
+              <p className="mt-2 text-dust">
+                {theater?.name}, {formatDateLong(showtime.dateTime)} at {formatTime(showtime.dateTime)}, {showtime.screenName}
+              </p>
+            )}
+          </div>
+          <span
+            className={`flex items-center gap-2 rounded-full border px-3 py-1 text-sm font-semibold ${
+              live ? "border-glow/50 text-glow" : "border-paper/20 text-dust"
+            }`}
+          >
+            <span className={`h-2 w-2 rounded-full ${live ? "animate-pulseDot bg-glow" : "bg-dust"}`} />
+            {live ? "Seats update live" : "Reconnecting…"}
+          </span>
+        </div>
+      </div>
+
+      <main className="mx-auto grid max-w-6xl gap-8 px-5 py-8 lg:grid-cols-[1fr_340px]">
+        <section aria-label="Seat map" className="min-w-0">
+          {/* Screen */}
+          <div className="relative mx-auto mb-4 max-w-2xl" aria-hidden="true">
+            <svg viewBox="0 0 400 36" className="relative w-full">
+              <defs>
+                <linearGradient id="screen" x1="0" x2="1">
+                  <stop offset="0" stopColor="#9fd8f0" stopOpacity="0" />
+                  <stop offset=".5" stopColor="#d9f2ff" />
+                  <stop offset="1" stopColor="#9fd8f0" stopOpacity="0" />
+                </linearGradient>
+              </defs>
+              <path d="M8 32 Q200 2 392 32" stroke="url(#screen)" strokeWidth="4" fill="none" strokeLinecap="round" />
+            </svg>
+            <div className="mx-auto -mt-1 h-28 w-[88%] bg-gradient-to-b from-glow/25 to-transparent [clip-path:polygon(6%_0,94%_0,100%_100%,0_100%)]" />
+            <p className="-mt-24 text-center text-xs font-semibold tracking-wide text-glow/70">Screen</p>
+          </div>
+
+          {/* Seat grid */}
+          <div className="overflow-x-auto pb-2">
+            <div className="mx-auto flex w-max flex-col gap-2 px-1 pt-8">
+              {rowLetters.map((letter) => {
+                const row = seatsByRow.get(letter) ?? [];
+                const aisleAfter = Math.floor((showtime?.seatsPerRow ?? 0) / 2);
+                return (
+                  <div key={letter} className="flex items-center gap-2" role="group" aria-label={`Row ${letter}`}>
+                    <span className="w-4 text-xs font-bold text-dust" aria-hidden="true">
+                      {letter}
+                    </span>
+                    <div className="flex gap-1 sm:gap-1.5">
+                      {row.map((seat, idx) => {
+                        const isSelected = selected.has(seat.id);
+                        const disabled = phase !== "selecting" || (seat.status !== "available" && !isSelected);
+                        const number = seat.id.slice(letter.length);
+                        const state = isSelected ? "selected" : seat.status === "held" ? "held by someone else" : seat.status;
+                        return (
+                          <button
+                            key={seat.id}
+                            disabled={disabled}
+                            onClick={() => toggleSeat(seat)}
+                            aria-pressed={isSelected}
+                            aria-label={`Seat ${seat.id}, ${seat.isPremium ? "premium" : "regular"}, ₹${seat.price}, ${state}`}
+                            title={`${seat.id}, ₹${seat.price}${seat.isPremium ? " (premium)" : ""}`}
+                            className={`seat flex h-[26px] w-[26px] items-center justify-center text-[10px] font-semibold disabled:cursor-not-allowed sm:h-9 sm:w-9 sm:text-[11px] ${seatClass(seat, isSelected)} ${
+                              flash.has(seat.id) ? "seat-flash" : ""
+                            } ${idx === aisleAfter ? "ml-3 sm:ml-5" : ""}`}
+                          >
+                            {number}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <p className="mt-4 h-5 text-center text-sm text-glow" aria-live="polite">
+            {lastEvent}
+          </p>
+
+          {/* Legend */}
+          <div className="mt-4 flex flex-wrap justify-center gap-x-6 gap-y-3 text-sm text-dust">
+            <span className="flex items-center gap-2">
+              <Swatch cls="seat-available" /> Regular{regularPrice ? ` ₹${regularPrice}` : ""}
+            </span>
+            <span className="flex items-center gap-2">
+              <Swatch cls="seat-premium" /> Premium{premiumPrice ? ` ₹${premiumPrice}` : ""}
+            </span>
+            <span className="flex items-center gap-2">
+              <Swatch cls="seat-selected" /> Your pick
+            </span>
+            <span className="flex items-center gap-2">
+              <Swatch cls="seat-held" /> Held by someone else
+            </span>
+            <span className="flex items-center gap-2">
+              <Swatch cls="seat-booked" /> Booked
+            </span>
+          </div>
+        </section>
+
+        {/* Ticket summary (desktop) */}
+        <aside className="hidden lg:block">
+          <div className="ticket sticky top-24">
+            <div className="p-6 pb-7">
+              <h2 className="display text-3xl">Your ticket</h2>
+              <p className="mt-1 text-sm opacity-70">{movie?.title}</p>
+
+              {phase === "held" && (
+                <div className="mt-4" role="timer" aria-label="Time left to pay">
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-sm font-semibold">{urgent ? "Hurry, seats release soon" : "Seats held for you"}</span>
+                    <span className={`display text-4xl ${urgent ? "text-[#b3261e]" : ""}`}>{clock}</span>
+                  </div>
+                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[#2a0c19]/15">
+                    <div className={`h-full transition-all duration-1000 ease-linear ${urgent ? "bg-[#b3261e]" : "bg-[#2a0c19]"}`} style={{ width: `${progress}%` }} />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="perf-h p-6">
+              {chosen.length === 0 ? (
+                <p className="py-4 text-sm opacity-70">Pick up to 10 seats on the map to see your total.</p>
+              ) : (
+                <>
+                  <div className="flex flex-wrap gap-1.5">
+                    {chosen.map((s) => (
+                      <span key={s.id} className="rounded bg-[#2a0c19] px-2 py-1 text-sm font-bold text-paper">
+                        {s.id}
+                      </span>
+                    ))}
+                  </div>
+                  <dl className="mt-4 space-y-1 text-sm">
+                    {regularCount > 0 && (
+                      <div className="flex justify-between">
+                        <dt>Regular × {regularCount}</dt>
+                        <dd>₹{regularTotal}</dd>
+                      </div>
+                    )}
+                    {premiumCount > 0 && (
+                      <div className="flex justify-between">
+                        <dt>Premium × {premiumCount}</dt>
+                        <dd>₹{premiumTotal}</dd>
+                      </div>
+                    )}
+                    <div className="flex justify-between border-t border-[#2a0c19]/20 pt-2 text-lg font-extrabold">
+                      <dt>Total</dt>
+                      <dd>₹{totalAmount}</dd>
+                    </div>
+                  </dl>
+                </>
+              )}
+              <div className="mt-5">{actions}</div>
+            </div>
+          </div>
+        </aside>
+      </main>
+
+      {/* Compact bar (mobile / tablet) */}
+      <div className="fixed inset-x-0 bottom-0 z-20 border-t border-paper/10 bg-pit/95 p-4 backdrop-blur lg:hidden">
+        <div className="mx-auto max-w-md">
+          {phase === "held" && (
+            <div className="mb-3" role="timer" aria-label="Time left to pay">
+              <div className="flex items-baseline justify-between text-sm">
+                <span className={urgent ? "font-semibold text-coral" : "text-dust"}>{urgent ? "Hurry, seats release soon" : "Seats held for you"}</span>
+                <span className={`display text-3xl ${urgent ? "text-coral" : "text-marquee"}`}>{clock}</span>
+              </div>
+              <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-paper/15">
+                <div className={`h-full transition-all duration-1000 ease-linear ${urgent ? "bg-coral" : "bg-marquee"}`} style={{ width: `${progress}%` }} />
+              </div>
+            </div>
+          )}
+          <div className="flex items-center gap-4">
+            <div className="min-w-0 flex-1">
+              {chosen.length === 0 ? (
+                <p className="text-sm text-dust">Pick your seats</p>
+              ) : (
+                <>
+                  <p className="font-bold">
+                    {chosen.length} {chosen.length === 1 ? "seat" : "seats"}, ₹{totalAmount}
+                  </p>
+                  <p className="truncate text-xs text-dust">{chosen.map((s) => s.id).join(", ")}</p>
+                </>
+              )}
             </div>
             {phase === "selecting" && (
               <button
                 onClick={proceedToHold}
-                className="bg-cinema-red text-white text-sm font-semibold px-5 py-2.5 rounded-lg hover:bg-cinema-redDark transition"
+                disabled={selected.size === 0}
+                className="shrink-0 rounded-full bg-marquee px-5 py-2.5 font-bold text-pit transition enabled:hover:brightness-110 disabled:opacity-40"
               >
-                Proceed
+                Hold seats
               </button>
             )}
             {phase === "held" && (
-              <button
-                onClick={confirmBooking}
-                className="bg-cinema-red text-white text-sm font-semibold px-5 py-2.5 rounded-lg hover:bg-cinema-redDark transition"
-              >
-                Confirm &amp; Pay
-              </button>
+              <div className="flex shrink-0 items-center gap-3">
+                <button onClick={changeSeats} className="text-sm font-semibold text-dust hover:text-paper">
+                  Change
+                </button>
+                <button onClick={confirmBooking} className="rounded-full bg-marquee px-5 py-2.5 font-bold text-pit transition hover:brightness-110">
+                  Pay ₹{totalAmount}
+                </button>
+              </div>
             )}
             {phase === "confirming" && (
-              <span className="text-sm text-cinema-muted px-5 py-2.5">Processing…</span>
+              <span className="flex shrink-0 items-center gap-2 text-sm text-dust">
+                <span className="h-4 w-4 animate-spin rounded-full border-2 border-marquee border-t-transparent" />
+                Confirming…
+              </span>
             )}
           </div>
-        )}
-      </main>
+        </div>
+      </div>
     </div>
   );
 }

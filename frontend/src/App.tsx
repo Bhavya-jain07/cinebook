@@ -1,4 +1,4 @@
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ToastProvider } from "./components/Toast";
 import { Home } from "./pages/Home";
 import { MovieDetail } from "./pages/MovieDetail";
@@ -9,7 +9,9 @@ import { Signin } from "./pages/Signin";
 
 function RequireAuth({ children }: { children: JSX.Element }) {
   const token = localStorage.getItem("token");
-  if (!token) return <Navigate to="/signin" replace />;
+  const location = useLocation();
+  // Remember where the user was headed so sign-in can send them straight back.
+  if (!token) return <Navigate to="/signin" replace state={{ from: location.pathname }} />;
   return children;
 }
 
