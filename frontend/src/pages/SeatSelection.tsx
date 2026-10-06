@@ -415,7 +415,7 @@ export function SeatSelection() {
       <main className="mx-auto grid max-w-6xl gap-8 px-5 py-8 lg:grid-cols-[1fr_340px]">
         <section aria-label="Seat map" className="min-w-0">
           {/* Screen */}
-          <div className="relative mx-auto mb-4 max-w-2xl" aria-hidden="true">
+          <div className="pointer-events-none relative mx-auto mb-4 max-w-2xl" aria-hidden="true">
             <svg viewBox="0 0 400 36" className="relative w-full">
               <defs>
                 <linearGradient id="screen" x1="0" x2="1">
@@ -431,7 +431,7 @@ export function SeatSelection() {
           </div>
 
           {/* Seat grid */}
-          <div className="overflow-x-auto pb-2">
+          <div className="relative z-10 overflow-x-auto pb-2">
             <div className="mx-auto flex w-max flex-col gap-2 px-1 pt-8">
               {rowLetters.map((letter) => {
                 const row = seatsByRow.get(letter) ?? [];

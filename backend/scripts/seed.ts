@@ -76,7 +76,7 @@ async function main() {
             dateTime,
             rows: 8,
             seatsPerRow: 10,
-            premiumRowIndexes: [0, 1],
+            premiumRowIndexes: [5, 6, 7],
             regularPrice: 180,
             premiumPrice: 320,
           });

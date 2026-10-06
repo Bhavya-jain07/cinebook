@@ -48,7 +48,7 @@ const ShowtimeSchema = new Schema({
   dateTime: { type: Date, required: true },
   rows: { type: Number, required: true, default: 8 },
   seatsPerRow: { type: Number, required: true, default: 10 },
-  premiumRowIndexes: { type: [Number], default: [0, 1] }, // first two rows are premium by default
+  premiumRowIndexes: { type: [Number], default: [5, 6, 7] }, // back rows are premium by default
   regularPrice: { type: Number, required: true, default: 180 },
   premiumPrice: { type: Number, required: true, default: 320 },
   bookedSeats: { type: [String], default: [] }, // e.g. ["A1", "A2", "C5"]
